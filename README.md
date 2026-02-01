@@ -101,7 +101,7 @@ python examples/server.py
 | `USE_ZMQ` | Use ZMQ + async engine for streaming (server) |
 | `QWEN3_TTS_MODEL_PATH` | Model directory (server env) |
 
-## Benchmark (L4 GPU, 0.6B custom model)
+## Benchmark (L4 GPU, 0.6B custom model, decode wav each 1 chunk)
 
 | Setup | First chunk latency (16 codec codes) | Inner chunk latency | RTF |
 |------|--------------------------------------|---------------------|-----|
