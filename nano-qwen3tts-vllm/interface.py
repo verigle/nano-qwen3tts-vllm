@@ -44,23 +44,20 @@ class Qwen3TTSInterface:
             
             self.predictor_input_embeddings = self.predictor_llm.model_runner.model.model.codec_embedding
         else:
-            # For async/ZMQ mode: engines run in separate processes, we need embeddings for prep
-            # Initialize a temporary engine just to get embeddings
-            temp_talker = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.3)
-            temp_predictor = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size)
+            # For async/ZMQ mode: engines run in separate processes. Load only embedding
+            # layers in the main process to avoid loading full talker+predictor (would cause
+            # CUDA OOM when engine processes also load their models).
+            from nano_qwen3tts_vllm.utils.embedding_loader import load_embeddings_only
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            (
+                self.model_config,
+                self.text_embedding,
+                self.input_embedding,
+                self.text_projection,
+                self.predictor_input_embeddings,
+            ) = load_embeddings_only(model_path, device=_device)
             self.processor = _get_processor(model_path)
-            self.model_config = temp_talker.model_runner.full_config
-            
-            self.text_embedding = temp_talker.model_runner.model.get_text_embeddings()
-            self.input_embedding = temp_talker.model_runner.model.get_input_embeddings()
-            self.text_projection = temp_talker.model_runner.model.text_projection
-            self.predictor_input_embeddings = temp_predictor.model_runner.model.model.codec_embedding
-            
-            # Clean up temporary engines
-            del temp_talker
-            del temp_predictor
-            torch.cuda.empty_cache()
-            
+
             # Create multiprocessing queues for sending requests to engine processes
             mp_ctx = mp.get_context('spawn')
             self._talker_request_queue = mp_ctx.Queue()
@@ -70,17 +67,22 @@ class Qwen3TTSInterface:
             # Use separate ZMQ ports for talker and predictor to avoid conflicts
             from nano_qwen3tts_vllm.engine.engine_core import talker_engine_core_loop, predictor_engine_core_loop
             
-            # Parse base address and create separate addresses for each engine
+            # Parse base address and create separate bind addresses for each engine.
+            # Main process zmq_bridge may already be bound to base_addr (e.g. 9555),
+            # so use base_port+1 and base_port+2 for talker and predictor to avoid conflict.
             base_addr = zmq_bridge.bind_address
             if ":" in base_addr:
                 proto_host, port = base_addr.rsplit(":", 1)
                 base_port = int(port)
-                talker_addr = f"{proto_host}:{base_port}"
-                predictor_addr = f"{proto_host}:{base_port + 1}"
+                talker_addr = f"{proto_host}:{base_port + 1}"
+                predictor_addr = f"{proto_host}:{base_port + 2}"
             else:
                 talker_addr = base_addr
                 predictor_addr = base_addr
             
+            # Two processes share one GPU: give each 50% budget so both get full KV cache (e.g. 24GB → 12GB each)
+            process_gpu_fraction = 0.3
+            gpu_util = 0.9
             self._talker_process = mp_ctx.Process(
                 target=talker_engine_core_loop,
                 args=(
@@ -91,7 +93,9 @@ class Qwen3TTSInterface:
                 kwargs={
                     'enforce_eager': enforce_eager,
                     'tensor_parallel_size': tensor_parallel_size,
-                    'gpu_memory_utilization': 0.1,
+                    'gpu_memory_utilization': gpu_util,
+                    'process_gpu_memory_fraction': process_gpu_fraction,
+                    'distributed_port': 2433,
                 },
                 daemon=False,
             )
@@ -106,7 +110,9 @@ class Qwen3TTSInterface:
                 kwargs={
                     'enforce_eager': enforce_eager,
                     'tensor_parallel_size': tensor_parallel_size,
-                    'gpu_memory_utilization': 0.1,
+                    'gpu_memory_utilization': gpu_util,
+                    'process_gpu_memory_fraction': process_gpu_fraction,
+                    'distributed_port': 2434,
                 },
                 daemon=False,
             )
@@ -315,10 +321,11 @@ class Qwen3TTSInterface:
             generation_step = 0
             
             # Send add_request to talker engine process via multiprocessing queue
+            # Detach tensors so they can be pickled across process boundaries (no requires_grad)
             talker_request = EngineRequest(
                 action="add_request",
                 request_id=request_id,
-                inputs_embeds=next_talker_embeds,
+                inputs_embeds=next_talker_embeds.detach().clone(),
                 sampling_params=talker_sampling_params,
             )
             self._talker_request_queue.put(talker_request)
@@ -358,10 +365,11 @@ class Qwen3TTSInterface:
                     predictor_inputs_embeds = torch.cat((last_hidden_state, last_id_hidden), dim=1)
                     
                     # Send add_request to predictor engine process via multiprocessing queue
+                    # Detach tensors so they can be pickled across process boundaries (no requires_grad)
                     predictor_request = EngineRequest(
                         action="add_request",
                         request_id=request_id,
-                        inputs_embeds=predictor_inputs_embeds,
+                        inputs_embeds=predictor_inputs_embeds.detach().clone(),
                         sampling_params=predictor_sampling_params,
                     )
                     self._predictor_request_queue.put(predictor_request)
@@ -387,7 +395,7 @@ class Qwen3TTSInterface:
                     talker_request = EngineRequest(
                         action="add_request",
                         request_id=request_id,
-                        inputs_embeds=next_talker_embeds,
+                        inputs_embeds=next_talker_embeds.detach().clone(),
                         sampling_params=talker_sampling_params,
                     )
                     self._talker_request_queue.put(talker_request)

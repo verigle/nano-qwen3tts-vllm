@@ -47,6 +47,8 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    distributed_port: int = 2333
+    process_gpu_memory_fraction: float | None = None  # When set (e.g. 0.5 for 2 processes), cap KV cache budget per process so each gets a fair share on shared GPU
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

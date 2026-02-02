@@ -32,7 +32,12 @@ class ModelRunner:
         self.event = event
 
         if not dist.is_initialized():
-            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+            dist.init_process_group(
+                "nccl",
+                f"tcp://localhost:{self.config.distributed_port}",
+                world_size=self.world_size,
+                rank=rank,
+            )
         torch.cuda.set_device(rank)
         # torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_dtype(torch.bfloat16)
@@ -66,7 +71,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if not self.enforce_eager and hasattr(self, "graphs"):
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         if dist.is_initialized():
@@ -116,14 +121,28 @@ class ModelRunner:
         hf_config = self.model_config
         torch_dtype = torch.bfloat16
         free, total = torch.cuda.mem_get_info()
-        used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+
+        if getattr(config, "process_gpu_memory_fraction", None) is not None:
+            # Multi-process on one GPU: cap this process to a fraction of total (e.g. 0.5 for 2 processes)
+            effective_total = total * config.process_gpu_memory_fraction
+            used = torch.cuda.memory_allocated()
+            raw_blocks = int(effective_total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        else:
+            used = total - free
+            raw_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+
+        config.num_kvcache_blocks = max(1, raw_blocks)
+        if raw_blocks <= 0:
+            import warnings
+            warnings.warn(
+                f"KV cache allocation would be 0 (gpu_memory_utilization={config.gpu_memory_utilization}, "
+                f"free~{total * config.gpu_memory_utilization - used - peak + current:.0f} bytes). Using 1 block."
+            )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

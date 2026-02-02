@@ -26,7 +26,9 @@ def talker_engine_core_loop(
     model_path: str,
     enforce_eager: bool = False,
     tensor_parallel_size: int = 1,
-    gpu_memory_utilization: float = 0.3,
+    gpu_memory_utilization: float = 0.9,
+    process_gpu_memory_fraction: float | None = None,
+    distributed_port: int = 2433,
 ) -> None:
     """
     Blocking loop for talker engine running in a dedicated process.
@@ -37,19 +39,23 @@ def talker_engine_core_loop(
         model_path: Path to model weights
         enforce_eager: Whether to enforce eager execution
         tensor_parallel_size: Tensor parallel size
-        gpu_memory_utilization: GPU memory utilization fraction
+        gpu_memory_utilization: GPU memory utilization fraction (within this process's share)
+        process_gpu_memory_fraction: When set (e.g. 0.5 for 2 processes), cap KV cache to this fraction of total GPU
+        distributed_port: Port for NCCL process group (must differ from predictor)
     """
     # Import inside process to avoid CUDA initialization issues
     from nano_qwen3tts_vllm.llm import TalkerLLM
     from nano_qwen3tts_vllm.zmq.output_bridge import ZMQOutputBridge
 
-    # Initialize engine and ZMQ bridge inside this process
-    talker_llm = TalkerLLM(
-        model_path,
+    kwargs = dict(
         enforce_eager=enforce_eager,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
+        distributed_port=distributed_port,
     )
+    if process_gpu_memory_fraction is not None:
+        kwargs["process_gpu_memory_fraction"] = process_gpu_memory_fraction
+    talker_llm = TalkerLLM(model_path, **kwargs)
 
     zmq_bridge = ZMQOutputBridge(bind_address=zmq_bridge_address)
 
@@ -110,6 +116,9 @@ def predictor_engine_core_loop(
     model_path: str,
     enforce_eager: bool = False,
     tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+    process_gpu_memory_fraction: float | None = None,
+    distributed_port: int = 2434,
 ) -> None:
     """
     Blocking loop for predictor engine running in a dedicated process.
@@ -120,17 +129,23 @@ def predictor_engine_core_loop(
         model_path: Path to model weights
         enforce_eager: Whether to enforce eager execution
         tensor_parallel_size: Tensor parallel size
+        gpu_memory_utilization: GPU memory utilization fraction (within this process's share)
+        process_gpu_memory_fraction: When set (e.g. 0.5 for 2 processes), cap KV cache to this fraction of total GPU
+        distributed_port: Port for NCCL process group (must differ from talker)
     """
     # Import inside process to avoid CUDA initialization issues
     from nano_qwen3tts_vllm.llm import PredictorLLM
     from nano_qwen3tts_vllm.zmq.output_bridge import ZMQOutputBridge
 
-    # Initialize engine and ZMQ bridge inside this process
-    predictor_llm = PredictorLLM(
-        model_path,
+    kwargs = dict(
         enforce_eager=enforce_eager,
         tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        distributed_port=distributed_port,
     )
+    if process_gpu_memory_fraction is not None:
+        kwargs["process_gpu_memory_fraction"] = process_gpu_memory_fraction
+    predictor_llm = PredictorLLM(model_path, **kwargs)
 
     zmq_bridge = ZMQOutputBridge(bind_address=zmq_bridge_address)
 
